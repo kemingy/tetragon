@@ -774,6 +774,11 @@ func (in *UProbeSpec) DeepCopyInto(out *UProbeSpec) {
 		*out = make([]KProbeArg, len(*in))
 		copy(*out, *in)
 	}
+	if in.ReturnArg != nil {
+		in, out := &in.ReturnArg, &out.ReturnArg
+		*out = new(KProbeArg)
+		**out = **in
+	}
 	if in.Tags != nil {
 		in, out := &in.Tags, &out.Tags
 		*out = make([]string, len(*in))
