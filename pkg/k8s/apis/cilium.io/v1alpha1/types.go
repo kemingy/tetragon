@@ -317,6 +317,10 @@ type UProbeSpec struct {
 	// List of the traced ref_ctr_offsets
 	RefCtrOffsets []uint64 `json:"refCtrOffsets,omitempty"`
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Indicates whether to collect return value of the traced function.
+	Return bool `json:"return"`
+	// +kubebuilder:validation:Optional
 	// A short message of 256 characters max that will be included
 	// in the event output to inform users what is going on.
 	Message string `json:"message"`
@@ -326,6 +330,13 @@ type UProbeSpec struct {
 	// +kubebuilder:validation:Optional
 	// A list of function arguments to include in the trace output.
 	Args []KProbeArg `json:"args,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A return argument to include in the trace output.
+	ReturnArg *KProbeArg `json:"returnArg,omitempty"`
+	// +kubebuilder:validation:Optional
+	// An action to perform on the return argument.
+	// Available actions are: Post;TrackSock;UntrackSock
+	ReturnArgAction string `json:"returnArgAction,omitempty"`
 	// +kubebuilder:validation:optional
 	// +kubebuilder:validation:MaxItems=16
 	// Tags to categorize the event, will be include in the event output.

@@ -13,6 +13,7 @@ import (
 	"path"
 
 	"github.com/cilium/ebpf"
+	lru "github.com/hashicorp/golang-lru/v2"
 
 	"github.com/cilium/tetragon/pkg/api/ops"
 	api "github.com/cilium/tetragon/pkg/api/tracingapi"
@@ -48,14 +49,25 @@ type genericUprobe struct {
 	address      uint64
 	refCtrOffset uint64
 	selectors    *selectors.KernelSelectorState
+	// return selectors for uretprobe
+	returnSelectors *selectors.KernelSelectorState
 	// policyName is the name of the policy that this uprobe belongs to
 	policyName string
 	// message field of the Tracing Policy
 	message string
 	// argument data printers
 	argPrinters []argPrinter
+	// return argument data printers
+	argReturnPrinters []argPrinter
 	// tags field of the Tracing Policy
 	tags []string
+	// for uprobes that have a uretprobe, we maintain the enter events in
+	// the map, so that we can merge them when the return event is
+	// generated. The events are maintained in the map below, using
+	// the retprobe_id (thread_id) and the enter ktime as the key.
+	pendingEvents *lru.Cache[pendingEventKey, pendingEvent]
+	// retprobe indicates if this uprobe has a uretprobe
+	retprobe bool
 }
 
 func (g *genericUprobe) SetID(id idtable.EntryID) {
@@ -236,12 +248,11 @@ func (k *observerUprobeSensor) LoadProbe(args sensors.LoadProbeArgs) error {
 func isValidUprobeSelectors(selectors []v1alpha1.KProbeSelector) error {
 	for _, s := range selectors {
 		if len(s.MatchArgs) > 0 ||
-			len(s.MatchReturnArgs) > 0 ||
 			len(s.MatchNamespaces) > 0 ||
 			len(s.MatchNamespaceChanges) > 0 ||
 			len(s.MatchCapabilities) > 0 ||
 			len(s.MatchCapabilityChanges) > 0 {
-			return errors.New("only matchPIDs selector is supported")
+			return errors.New("only matchPIDs and matchReturnArgs selectors are supported")
 		}
 	}
 	return nil
@@ -324,6 +335,9 @@ func createGenericUprobeSensor(
 
 func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn) ([]idtable.EntryID, error) {
 	var args []v1alpha1.KProbeArg
+	var argReturnPrinters []argPrinter
+	var setRetprobe bool
+	var argRetprobe *v1alpha1.KProbeArg
 
 	symbols := len(spec.Symbols)
 	offsets := len(spec.Offsets)
@@ -378,6 +392,18 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 		return nil, err
 	}
 
+	// Handle ReturnArgAction  
+	eventConfig := initEventConfig()
+	if len(spec.ReturnArgAction) > 0 {
+		if !config.EnableLargeProgs() {
+			return nil, errors.New("ReturnArgAction requires kernel >=5.3")
+		}
+		eventConfig.ArgReturnAction = selectors.ActionTypeFromString(spec.ReturnArgAction)
+		if eventConfig.ArgReturnAction == selectors.ActionTypeInvalid {
+			return nil, fmt.Errorf("ReturnArgAction type '%s' unsupported", spec.ReturnArgAction)
+		}
+	}
+
 	// Parse Arguments
 	for i, a := range spec.Args {
 		argType := gt.GenericTypeFromString(a.Type)
@@ -387,6 +413,9 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 		argMValue, err := getMetaValue(&a)
 		if err != nil {
 			return nil, err
+		}
+		if argReturnCopy(argMValue) {
+			argRetprobe = &spec.Args[i]
 		}
 		if a.Index > 4 {
 			return nil, fmt.Errorf("error add arg: ArgType %s Index %d out of bounds",
@@ -403,6 +432,60 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 		argPrinters = append(argPrinters, argPrinter{index: i, ty: argType})
 	}
 
+	// Parse ReturnArg, we have two types of return arg parsing. We
+	// support populating a uprobe buffer from uretprobe hooks. This
+	// is used to capture data that is populated by the function hooked.
+	// For example Read calls supply a buffer to the syscall, but we
+	// wont have its contents until uretprobe is run. The other type is
+	// the spec.Return case. These capture the return value of the function
+	// without context from the uprobe hook. The BTF argument 'argreturn'
+	// instructs the BPF uretprobe program which type of copy to use. And
+	// argReturnPrinters tell golang printer piece how to print the event.
+	if spec.Return {
+		if spec.ReturnArg == nil {
+			return nil, errors.New("ReturnArg not specified with Return=true")
+		}
+		argType := gt.GenericTypeFromString(spec.ReturnArg.Type)
+		if argType == gt.GenericInvalidType {
+			if spec.ReturnArg.Type == "" {
+				return nil, errors.New("ReturnArg not specified with Return=true")
+			}
+			return nil, fmt.Errorf("ReturnArg type '%s' unsupported", spec.ReturnArg.Type)
+		}
+		eventConfig.ArgReturn = int32(argType)
+		argP := argPrinter{index: api.ReturnArgIndex, ty: argType}
+		argReturnPrinters = append(argReturnPrinters, argP)
+	} else {
+		eventConfig.ArgReturn = int32(0)
+	}
+
+	if argRetprobe != nil {
+		setRetprobe = true
+
+		argType := gt.GenericTypeFromString(argRetprobe.Type)
+		eventConfig.ArgReturnCopy = int32(argType)
+
+		argP := argPrinter{index: int(argRetprobe.Index), ty: argType, label: argRetprobe.Label}
+		argReturnPrinters = append(argReturnPrinters, argP)
+	} else {
+		eventConfig.ArgReturnCopy = int32(0)
+	}
+
+	// Write attributes into BTF ptr for use with load
+	if !setRetprobe {
+		setRetprobe = spec.Return
+	}
+
+	// Initialize return selectors if needed
+	var returnSelectorState *selectors.KernelSelectorState
+	if spec.Return {
+		var err error
+		returnSelectorState, err = selectors.InitKernelReturnSelectorState(spec.Selectors, spec.ReturnArg, nil, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	addUprobeEntry := func(sym string, offset uint64, idx int) {
 		var refCtrOffset uint64
 
@@ -410,23 +493,39 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 			refCtrOffset = spec.RefCtrOffsets[idx]
 		}
 
-		config := initEventConfig()
+		// Copy the event config and set the specific fields
+		config := *eventConfig
 		config.ArgType = argTypes
 		config.ArgMeta = argMeta
 		config.ArgIndex = argIdx
 
+		// Initialize pending events cache if retprobe is enabled
+		var pendingEventsCache *lru.Cache[pendingEventKey, pendingEvent]
+		if setRetprobe {
+			var err error
+			pendingEventsCache, err = lru.New[pendingEventKey, pendingEvent](4096)
+			if err != nil {
+				logger.GetLogger().Warn("Failed to create pending events cache", logfields.Error, err)
+				return
+			}
+		}
+
 		uprobeEntry := &genericUprobe{
-			tableId:      idtable.UninitializedEntryID,
-			config:       config,
-			path:         spec.Path,
-			symbol:       sym,
-			address:      offset,
-			refCtrOffset: refCtrOffset,
-			selectors:    uprobeSelectorState,
-			policyName:   in.policyName,
-			message:      msgField,
-			argPrinters:  argPrinters,
-			tags:         tagsField,
+			tableId:           idtable.UninitializedEntryID,
+			config:            &config,
+			path:              spec.Path,
+			symbol:            sym,
+			address:           offset,
+			refCtrOffset:      refCtrOffset,
+			selectors:         uprobeSelectorState,
+			returnSelectors:   returnSelectorState,
+			policyName:        in.policyName,
+			message:           msgField,
+			argPrinters:       argPrinters,
+			argReturnPrinters: argReturnPrinters,
+			tags:              tagsField,
+			pendingEvents:     pendingEventsCache,
+			retprobe:          setRetprobe,
 		}
 
 		uprobeTable.AddEntry(uprobeEntry)
