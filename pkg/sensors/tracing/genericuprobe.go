@@ -49,6 +49,8 @@ type genericUprobe struct {
 	address      uint64
 	refCtrOffset uint64
 	selectors    *selectors.KernelSelectorState
+	// return selectors for uretprobe
+	returnSelectors *selectors.KernelSelectorState
 	// policyName is the name of the policy that this uprobe belongs to
 	policyName string
 	// message field of the Tracing Policy
@@ -246,12 +248,11 @@ func (k *observerUprobeSensor) LoadProbe(args sensors.LoadProbeArgs) error {
 func isValidUprobeSelectors(selectors []v1alpha1.KProbeSelector) error {
 	for _, s := range selectors {
 		if len(s.MatchArgs) > 0 ||
-			len(s.MatchReturnArgs) > 0 ||
 			len(s.MatchNamespaces) > 0 ||
 			len(s.MatchNamespaceChanges) > 0 ||
 			len(s.MatchCapabilities) > 0 ||
 			len(s.MatchCapabilityChanges) > 0 {
-			return errors.New("only matchPIDs selector is supported")
+			return errors.New("only matchPIDs and matchReturnArgs selectors are supported")
 		}
 	}
 	return nil
@@ -475,6 +476,16 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 		setRetprobe = spec.Return
 	}
 
+	// Initialize return selectors if needed
+	var returnSelectorState *selectors.KernelSelectorState
+	if spec.Return {
+		var err error
+		returnSelectorState, err = selectors.InitKernelReturnSelectorState(spec.Selectors, spec.ReturnArg, nil, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	addUprobeEntry := func(sym string, offset uint64, idx int) {
 		var refCtrOffset uint64
 
@@ -507,6 +518,7 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 			address:           offset,
 			refCtrOffset:      refCtrOffset,
 			selectors:         uprobeSelectorState,
+			returnSelectors:   returnSelectorState,
 			policyName:        in.policyName,
 			message:           msgField,
 			argPrinters:       argPrinters,
